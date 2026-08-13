@@ -15,7 +15,6 @@ ansible-galaxy collection install ansible.windows community.windows
 cd lab-control/backend
 pip3 install -r requirements.txt
 ```
-
 ## 2. Prepare the test PCs
 
 ### Linux test PC
