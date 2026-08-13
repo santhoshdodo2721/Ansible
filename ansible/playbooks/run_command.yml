@@ -4,10 +4,43 @@
   gather_facts: false
 
   tasks:
+
     - name: Run command on Linux
       ansible.builtin.shell: "{{ cmd }}"
-      register: command_result
+      register: linux_result
+      when: inventory_hostname in groups['linux_clients']
 
-    - name: Show output
+    - name: Run command on Windows
+      ansible.windows.win_shell: "{{ cmd }}"
+      register: windows_result
+      when: inventory_hostname in groups['windows_clients']
+
+    - name: Show Linux output
       ansible.builtin.debug:
-        var: command_result.stdout_lines
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "OS: Linux"
+          - "Command: {{ cmd }}"
+          - "Return code: {{ linux_result.rc | default('N/A') }}"
+          - "Output:"
+          - "{{ linux_result.stdout_lines | default([]) }}"
+          - "Error:"
+          - "{{ linux_result.stderr_lines | default([]) }}"
+      when:
+        - inventory_hostname in groups['linux_clients']
+        - linux_result is defined
+
+    - name: Show Windows output
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "OS: Windows"
+          - "Command: {{ cmd }}"
+          - "Return code: {{ windows_result.rc | default('N/A') }}"
+          - "Output:"
+          - "{{ windows_result.stdout_lines | default([]) }}"
+          - "Error:"
+          - "{{ windows_result.stderr_lines | default([]) }}"
+      when:
+        - inventory_hostname in groups['windows_clients']
+        - windows_result is defined
