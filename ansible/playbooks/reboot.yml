@@ -1,0 +1,17 @@
+---
+- hosts: linux_clients
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Reboot Linux host
+      ansible.builtin.reboot:
+        reboot_timeout: 120
+      when: inventory_hostname in target_list
+
+- hosts: windows_clients
+  gather_facts: false
+  tasks:
+    - name: Reboot Windows host
+      ansible.windows.win_reboot:
+        reboot_timeout: 120
+      when: inventory_hostname in target_list

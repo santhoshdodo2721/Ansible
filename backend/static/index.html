@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab Control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0B0F14;
+    --panel:#121820;
+    --panel-2:#0E1319;
+    --line:#1F2A35;
+    --text:#E6EDF3;
+    --muted:#7C8B99;
+    --signal:#00D9A3;
+    --amber:#FFB020;
+    --red:#FF4D4D;
+    --mono:'JetBrains Mono', monospace;
+    --sans:'Inter', sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:var(--sans);
+    min-height:100vh;
+  }
+  header{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:20px 28px; border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg, var(--panel-2), var(--bg));
+  }
+  header .brand{display:flex; align-items:center; gap:12px}
+  header .dot{
+    width:10px; height:10px; border-radius:50%; background:var(--signal);
+    box-shadow:0 0 8px var(--signal);
+    animation:pulse 2s infinite;
+  }
+  @keyframes pulse{
+    0%,100%{opacity:1} 50%{opacity:.35}
+  }
+  header h1{font-size:16px; letter-spacing:.08em; margin:0; text-transform:uppercase; font-weight:700}
+  header .sub{color:var(--muted); font-family:var(--mono); font-size:12px}
+  header .summary{font-family:var(--mono); font-size:13px; color:var(--muted); display:flex; gap:18px}
+  header .summary b{color:var(--text)}
+
+  main{padding:24px 28px; max-width:1200px; margin:0 auto; display:flex; flex-direction:column; gap:24px}
+
+  .panel{
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:18px 20px;
+  }
+  .panel h2{
+    font-size:12px; text-transform:uppercase; letter-spacing:.1em;
+    color:var(--muted); margin:0 0 14px 0; font-weight:600;
+  }
+
+  #host-grid{display:grid; grid-template-columns:repeat(auto-fill, minmax(220px,1fr)); gap:12px}
+  .host-card{
+    border:1px solid var(--line); border-radius:6px; padding:12px 14px;
+    background:var(--panel-2); cursor:pointer; user-select:none;
+    transition:border-color .15s;
+  }
+  .host-card.selected{border-color:var(--signal)}
+  .host-card .row{display:flex; align-items:center; justify-content:space-between}
+  .host-card .name{font-family:var(--mono); font-size:14px; font-weight:500}
+  .host-card .group{color:var(--muted); font-size:11px; font-family:var(--mono); margin-top:2px}
+  .host-card .addr{color:var(--muted); font-size:11px; font-family:var(--mono); margin-top:6px}
+  .status-dot{width:8px; height:8px; border-radius:50%; flex-shrink:0}
+  .status-dot.on{background:var(--signal); box-shadow:0 0 6px var(--signal)}
+  .status-dot.off{background:var(--red)}
+  .facts{margin-top:8px; font-size:11px; font-family:var(--mono); color:var(--muted); line-height:1.6}
+
+  .controls-row{display:flex; gap:12px; flex-wrap:wrap}
+  input[type=text], select{
+    background:var(--panel-2); border:1px solid var(--line); color:var(--text);
+    padding:9px 12px; border-radius:6px; font-family:var(--mono); font-size:13px;
+    flex:1; min-width:200px;
+  }
+  input[type=text]:focus, select:focus{outline:1px solid var(--signal)}
+  button{
+    background:var(--signal); color:#04140F; border:none; border-radius:6px;
+    padding:9px 18px; font-family:var(--sans); font-weight:600; font-size:13px;
+    cursor:pointer; transition:opacity .15s;
+  }
+  button:hover{opacity:.85}
+  button:disabled{background:var(--line); color:var(--muted); cursor:not-allowed}
+  button.danger{background:var(--red); color:#1a0000}
+  button.amber{background:var(--amber); color:#241700}
+  button.ghost{background:transparent; border:1px solid var(--line); color:var(--text)}
+
+  .console{
+    background:#05080B; border:1px solid var(--line); border-radius:6px;
+    padding:14px; font-family:var(--mono); font-size:12.5px; color:var(--signal);
+    height:220px; overflow-y:auto; white-space:pre-wrap; margin-top:12px;
+  }
+  .console .err{color:var(--red)}
+  .console .meta{color:var(--muted)}
+
+  .power-row{display:flex; gap:10px; margin-top:4px}
+  .selected-tag{
+    font-family:var(--mono); font-size:11px; color:var(--muted); margin-top:10px;
+  }
+  footer{
+    text-align:center; padding:24px; color:var(--muted); font-family:var(--mono); font-size:11px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="dot"></span>
+    <div>
+      <h1>Lab Control</h1>
+      <div class="sub">ansible master console</div>
+    </div>
+  </div>
+  <div class="summary" id="summary">
+    <span><b id="count-total">0</b> hosts</span>
+    <span><b id="count-online" style="color:var(--signal)">0</b> online</span>
+  </div>
+</header>
+
+<main>
+
+  <div class="panel">
+    <h2>Hosts <span id="refresh-note" style="text-transform:none; letter-spacing:0; font-weight:400"></span></h2>
+    <div id="host-grid"></div>
+    <div class="selected-tag" id="selected-tag">No hosts selected. Click cards to select targets for the actions below.</div>
+    <div class="controls-row" style="margin-top:14px">
+      <button class="ghost" onclick="refreshHosts()">Refresh status</button>
+      <button class="ghost" onclick="loadFacts()">Load facts (CPU/RAM/disk)</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Run command</h2>
+    <div class="controls-row">
+      <input type="text" id="cmd-input" placeholder="e.g. df -h  (Linux hosts run shell, Windows hosts run PowerShell)">
+      <button onclick="runCommand()">Run on selected</button>
+    </div>
+    <div class="console" id="cmd-console">$ waiting for command...</div>
+  </div>
+
+  <div class="panel">
+    <h2>Install package</h2>
+    <div class="controls-row">
+      <input type="text" id="pkg-input" placeholder="package name, e.g. htop (apt) / googlechrome (choco)">
+      <button onclick="installPackage()">Install on selected</button>
+    </div>
+    <div class="console" id="install-console">$ waiting...</div>
+  </div>
+
+  <div class="panel">
+    <h2>Power control</h2>
+    <div class="power-row">
+      <button class="ghost" onclick="power('wake')">Wake (WOL)</button>
+      <button class="amber" onclick="power('reboot')">Reboot</button>
+      <button class="danger" onclick="power('shutdown')">Shutdown</button>
+    </div>
+    <div class="console" id="power-console">$ waiting...</div>
+  </div>
+
+</main>
+
+<footer>2 test hosts today &middot; add more entries to ansible/inventory/hosts.yml to scale to the full lab</footer>
+
+<script>
+let hosts = [];
+let facts = {};
+let selected = new Set();
+
+function log(el, text, isErr=false){
+  const c = document.getElementById(el);
+  const line = document.createElement('div');
+  if(isErr) line.className = 'err';
+  line.textContent = text;
+  c.appendChild(line);
+  c.scrollTop = c.scrollHeight;
+}
+function clearLog(el){ document.getElementById(el).innerHTML = ''; }
+
+function renderGrid(){
+  const grid = document.getElementById('host-grid');
+  grid.innerHTML = '';
+  let online = 0;
+  hosts.forEach(h => {
+    if(h.online) online++;
+    const card = document.createElement('div');
+    card.className = 'host-card' + (selected.has(h.name) ? ' selected' : '');
+    const f = facts[h.name];
+    card.innerHTML = `
+      <div class="row">
+        <span class="name">${h.name}</span>
+        <span class="status-dot ${h.online ? 'on' : 'off'}"></span>
+      </div>
+      <div class="group">${h.group.replace('_',' ')}</div>
+      <div class="addr">${h.address || ''}</div>
+      ${f ? `<div class="facts">${f.distribution || f.os_family || ''}<br>mem ${f.memfree_mb}/${f.memtotal_mb} MB free<br>disk ${f.disk_size_available_gb}/${f.disk_size_total_gb} GB free</div>` : ''}
+    `;
+    card.onclick = () => {
+      if(selected.has(h.name)) selected.delete(h.name); else selected.add(h.name);
+      renderGrid();
+    };
+    grid.appendChild(card);
+  });
+  document.getElementById('count-total').textContent = hosts.length;
+  document.getElementById('count-online').textContent = online;
+  document.getElementById('selected-tag').textContent =
+    selected.size ? `Selected: ${[...selected].join(', ')}` : 'No hosts selected. Click cards to select targets for the actions below.';
+}
+
+async function refreshHosts(){
+  document.getElementById('refresh-note').textContent = '(checking...)';
+  try{
+    const res = await fetch('/api/hosts');
+    const data = await res.json();
+    hosts = data.hosts;
+    renderGrid();
+  }catch(e){
+    console.error(e);
+  }
+  document.getElementById('refresh-note').textContent = '';
+}
+
+async function loadFacts(){
+  document.getElementById('refresh-note').textContent = '(gathering facts, may take a moment...)';
+  try{
+    const res = await fetch('/api/facts');
+    const data = await res.json();
+    facts = data.facts;
+    renderGrid();
+  }catch(e){
+    console.error(e);
+  }
+  document.getElementById('refresh-note').textContent = '';
+}
+
+function requireSelection(){
+  if(selected.size === 0){
+    alert('Select at least one host first.');
+    return false;
+  }
+  return true;
+}
+
+async function runCommand(){
+  if(!requireSelection()) return;
+  const command = document.getElementById('cmd-input').value.trim();
+  if(!command) return;
+  clearLog('cmd-console');
+  log('cmd-console', `$ running "${command}" on ${[...selected].join(', ')}...`);
+  try{
+    const res = await fetch('/api/run-command', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({hosts:[...selected], command})
+    });
+    const data = await res.json();
+    printResult('cmd-console', data);
+  }catch(e){
+    log('cmd-console', String(e), true);
+  }
+}
+
+async function installPackage(){
+  if(!requireSelection()) return;
+  const pkg = document.getElementById('pkg-input').value.trim();
+  if(!pkg) return;
+  clearLog('install-console');
+  log('install-console', `$ installing "${pkg}" on ${[...selected].join(', ')}...`);
+  try{
+    const res = await fetch('/api/install', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({hosts:[...selected], package: pkg})
+    });
+    const data = await res.json();
+    printResult('install-console', data);
+  }catch(e){
+    log('install-console', String(e), true);
+  }
+}
+
+async function power(action){
+  if(!requireSelection()) return;
+  if(action !== 'wake' && !confirm(`${action.toUpperCase()} ${[...selected].join(', ')}?`)) return;
+  clearLog('power-console');
+  log('power-console', `$ ${action} -> ${[...selected].join(', ')}...`);
+  try{
+    const res = await fetch('/api/power', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({hosts:[...selected], action})
+    });
+    const data = await res.json();
+    printResult('power-console', data);
+  }catch(e){
+    log('power-console', String(e), true);
+  }
+}
+
+function printResult(el, data){
+  if(data.sent){ log(el, `sent to: ${data.sent.join(', ')}`); }
+  if(data.errors && data.errors.length){ data.errors.forEach(e => log(el, e, true)); }
+  if(data.data && data.data.plays){
+    data.data.plays.forEach(play => {
+      (play.tasks || []).forEach(task => {
+        Object.entries(task.hosts || {}).forEach(([host, res]) => {
+          if(res.skipped) return;
+          const tag = res.failed || res.unreachable ? 'FAIL' : 'OK';
+          log(el, `[${tag}] ${host}: ${task.task && task.task.name || ''}`, tag==='FAIL');
+          if(res.stdout_lines) res.stdout_lines.forEach(l => log(el, '  ' + l));
+          if(res.msg) log(el, '  ' + res.msg, tag==='FAIL');
+        });
+      });
+    });
+  } else if(data.raw_stdout){
+    log(el, data.raw_stdout);
+  }
+  if(data.stderr) log(el, data.stderr, true);
+}
+
+refreshHosts();
+setInterval(refreshHosts, 15000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,13 @@
+---
+- name: Run a command on lab PCs
+  hosts: "{{ target | default('linux_clients') }}"
+  gather_facts: false
+
+  tasks:
+    - name: Run command on Linux
+      ansible.builtin.shell: "{{ cmd }}"
+      register: command_result
+
+    - name: Show output
+      ansible.builtin.debug:
+        var: command_result.stdout_lines
