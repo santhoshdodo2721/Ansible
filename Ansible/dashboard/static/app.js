@@ -371,6 +371,11 @@
         case "applied":
           setStage("apply", "done");
           break;
+        case "applied_fail":
+          setStage("apply", "fail");
+          break;
+        case "verify":
+          break;
         case "final_fail":
           STAGE_ORDER.forEach((s) => {
             const el = pipelineEl.querySelector('.pipeline-step[data-stage="' + s + '"]');
@@ -389,18 +394,24 @@
       toast("Describe a task before running Smart task.", "warn");
       return;
     }
+    const hosts = selectedHosts();
+    if (!hosts.length) {
+      toast("Select at least one machine first.", "warn");
+      return;
+    }
     const autoApply = document.getElementById("auto-apply").checked;
 
     resetPipeline();
     setStage("facts", "active");
     logLine("smart task -> " + prompt, "term-cmd");
+    logLine("targets -> " + hosts.join(", "), "term-system");
     logLine("generating and validating a playbook, this can take a moment…", "term-system");
 
     try {
       const res = await fetch("/api/smart_action", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, target_group: "linux_lab", auto_apply: autoApply }),
+        body: JSON.stringify({ prompt, hosts, auto_apply: autoApply }),
       });
       const data = await res.json();
 

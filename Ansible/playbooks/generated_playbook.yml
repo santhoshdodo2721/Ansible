@@ -1,0 +1,11 @@
+- hosts: cys16
+  become: true
+  tasks:
+    - name: Retrieve dolphin package information
+      command: dpkg -s dolphin
+      register: dolphin_pkg
+      changed_when: false
+
+    - name: Verify dolphin package is installed and has a version
+      shell: dpkg -s dolphin | grep -q '^Version:'
+      when: not ansible_check_mode
