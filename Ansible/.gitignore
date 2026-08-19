@@ -1,0 +1,5 @@
+generate_playbook.py
+__pycache__/
+*.pyc
+vault/keys/
+*.pem

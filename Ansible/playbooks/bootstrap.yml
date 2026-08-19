@@ -1,0 +1,63 @@
+---
+# One-time bootstrap: makes each machine Ansible-ready.
+#   - Linux: passwordless sudo for the ansible user, ensures python3
+#   - Windows: ensures OpenSSH Server is installed/running, key auth enabled
+- name: Bootstrap Linux hosts
+  hosts: linux_lab
+  become: true
+  tasks:
+    - name: Ensure python3 is present
+      package:
+        name: python3
+        state: present
+        update_cache: yes
+      when: ansible_facts.os_family != "unknown"
+
+    - name: Passwordless sudo for the ansible user
+      copy:
+        dest: "/etc/sudoers.d/{{ ansible_user }}"
+        content: "{{ ansible_user }} ALL=(ALL) NOPASSWD: ALL\n"
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+
+- name: Bootstrap Windows hosts
+  hosts: windows_lab
+  gather_facts: false
+  vars:
+    pubkey: "{{ lookup('file', 'vault/keys/' ~ inventory_hostname ~ '.pub') }}"
+  tasks:
+    - name: Ensure OpenSSH Server feature is installed
+      ansible.windows.win_feature:
+        name: OpenSSH.Server
+        state: present
+
+    - name: Start and auto-start sshd service
+      ansible.windows.win_service:
+        name: sshd
+        state: started
+        start_mode: auto
+
+    - name: Authorize the ansible user's SSH key
+      ansible.windows.win_shell: |
+        $key = '{{ pubkey }}'
+        $user = '{{ ansible_user }}'
+
+        $userPath = "C:\Users\$user\.ssh\authorized_keys"
+        $dir = Split-Path $userPath
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $exists = (Test-Path $userPath) -and ((Get-Content $userPath -Raw) -match [regex]::Escape($key))
+        if (-not $exists) {
+          Add-Content -Path $userPath -Value $key -Encoding ascii
+          icacls $userPath /inheritance:r /grant "$user:F" | Out-Null
+        }
+
+        $isAdmin = (whoami /groups) -match "S-1-5-32-544"
+        if ($isAdmin) {
+          $adminPath = "$env:ProgramData\ssh\administrators_authorized_keys"
+          if (-not (Test-Path $adminPath)) { New-Item -ItemType File -Path $adminPath -Force | Out-Null }
+          $exists = (Get-Content $adminPath -Raw) -match [regex]::Escape($key)
+          if (-not $exists) {
+            Add-Content -Path $adminPath -Value $key -Encoding ascii
+            icacls $adminPath /inheritance:r /grant "Administrators:F" "SYSTEM:F" | Out-Null
+          }
+        }

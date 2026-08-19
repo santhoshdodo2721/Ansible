@@ -1,723 +1,1171 @@
-"""
-Lab Control backend.
-
-Wraps Ansible / ansible-playbook and serves:
-    - Host status
-    - Host facts
-    - Remote command execution
-    - Package installation
-    - Reboot
-    - Shutdown
-    - Wake-on-LAN
-
-Run with:
-
-    uvicorn main:app --host 0.0.0.0 --port 8000
-"""
-
-import json
 import os
-import subprocess
-
-from pathlib import Path
-from typing import List, Optional
-
+import re
+import json
 import yaml
+import shlex
+import socket
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-
-from wol import send_magic_packet
+from pydantic import BaseModel, Field
 
 
-# ============================================================================
-# PATHS
-# ============================================================================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
 ANSIBLE_DIR = BASE_DIR.parent / "ansible"
+INVENTORY = ANSIBLE_DIR / "inventory" / "hosts.yml"
 
-INVENTORY_FILE = ANSIBLE_DIR / "inventory" / "hosts.yml"
-
-PLAYBOOK_DIR = ANSIBLE_DIR / "playbooks"
-
-STATIC_DIR = BASE_DIR / "static"
-
-
-# ============================================================================
-# FASTAPI APPLICATION
-# ============================================================================
+ANSIBLE_TIMEOUT = 20
 
 app = FastAPI(
-    title="Lab Control API",
+    title="Lab Control",
+    description="Ansible Lab Master Console",
     version="1.0.0",
 )
-
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ============================================================================
-# ANSIBLE HELPER
-# ============================================================================
+# ============================================================
+# MODELS
+# ============================================================
 
-def run_ansible(
-    args: List[str],
-    extra_env: Optional[dict] = None,
-) -> dict:
+class CommandRequest(BaseModel):
+    hosts: List[str]
+    command: str = Field(min_length=1)
+
+
+class PackageRequest(BaseModel):
+    hosts: List[str]
+    package: str = Field(min_length=1)
+
+
+class PowerRequest(BaseModel):
+    hosts: List[str]
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def run_process(
+    command: List[str],
+    timeout: int = ANSIBLE_TIMEOUT,
+) -> subprocess.CompletedProcess:
     """
-    Execute an Ansible command.
-
-    The command is executed from the Ansible directory so that:
-
-        ansible.cfg
-        inventory/
-        playbooks/
-
-    are available.
+    Execute a subprocess safely without shell=True.
     """
 
-    env = os.environ.copy()
+    try:
+        return subprocess.run(
+            command,
+            cwd=str(ANSIBLE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
 
-    # Your ansible.cfg already uses JSON callback.
-    env["ANSIBLE_STDOUT_CALLBACK"] = "json"
-    env["ANSIBLE_LOAD_CALLBACK_PLUGINS"] = "1"
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            command,
+            returncode=124,
+            stdout=exc.stdout or "",
+            stderr=f"Command timed out after {timeout} seconds",
+        )
 
-    if extra_env:
-        env.update(extra_env)
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            command,
+            returncode=1,
+            stdout="",
+            stderr=str(exc),
+        )
+
+
+def inventory_exists() -> bool:
+    return INVENTORY.exists()
+
+
+def load_inventory() -> Dict[str, Any]:
+    """
+    Load the YAML inventory.
+
+    Expected structure:
+
+    all:
+      children:
+        linux_clients:
+          hosts:
+            linux-pc1:
+              ...
+        windows_clients:
+          hosts:
+            win-pc1:
+              ...
+    """
+
+    if not inventory_exists():
+        raise RuntimeError(
+            f"Inventory not found: {INVENTORY}"
+        )
+
+    try:
+        with open(INVENTORY, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+
+        return data
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read inventory: {exc}"
+        )
+
+
+def get_groups() -> Dict[str, Dict[str, Any]]:
+    """
+    Return hosts grouped by their Ansible group.
+    """
+
+    inventory = load_inventory()
+
+    all_data = inventory.get("all", {})
+    children = all_data.get("children", {})
+
+    result = {
+        "linux_clients": {},
+        "windows_clients": {},
+    }
+
+    for group_name in result.keys():
+
+        group = children.get(group_name, {})
+
+        hosts = group.get("hosts", {})
+
+        if isinstance(hosts, dict):
+            result[group_name] = hosts
+
+    return result
+
+
+def get_host_info(hostname: str) -> Optional[Dict[str, Any]]:
+    """
+    Find a host and determine whether it is Linux or Windows.
+    """
+
+    groups = get_groups()
+
+    if hostname in groups["linux_clients"]:
+        info = groups["linux_clients"][hostname] or {}
+
+        return {
+            "name": hostname,
+            "group": "linux_clients",
+            "os": "linux",
+            "info": info,
+        }
+
+    if hostname in groups["windows_clients"]:
+        info = groups["windows_clients"][hostname] or {}
+
+        return {
+            "name": hostname,
+            "group": "windows_clients",
+            "os": "windows",
+            "info": info,
+        }
+
+    return None
+
+
+def get_all_hosts() -> List[Dict[str, Any]]:
+    """
+    Return all hosts from inventory.
+    """
+
+    groups = get_groups()
+
+    hosts = []
+
+    for hostname, info in groups["linux_clients"].items():
+        info = info or {}
+
+        hosts.append(
+            {
+                "name": hostname,
+                "hostname": hostname,
+                "group": "linux_clients",
+                "os": "linux",
+                "ip": info.get("ansible_host", ""),
+                "mac_address": info.get("mac_address", ""),
+            }
+        )
+
+    for hostname, info in groups["windows_clients"].items():
+        info = info or {}
+
+        hosts.append(
+            {
+                "name": hostname,
+                "hostname": hostname,
+                "group": "windows_clients",
+                "os": "windows",
+                "ip": info.get("ansible_host", ""),
+                "mac_address": info.get("mac_address", ""),
+            }
+        )
+
+    return hosts
+
+
+def windows_password(host_info: Dict[str, Any]) -> str:
+    """
+    Get Windows password.
+
+    Priority:
+
+    1. Environment variable LAB_WINDOWS_PASSWORD
+    2. ansible_password from inventory
+    """
+
+    env_password = os.getenv("LAB_WINDOWS_PASSWORD")
+
+    if env_password:
+        return env_password
+
+    info = host_info.get("info", {})
+
+    return str(info.get("ansible_password", "") or "")
+
+
+def build_ansible_command(
+    hostname: str,
+    module: str,
+    extra_vars: Optional[Dict[str, Any]] = None,
+    module_args: Optional[str] = None,
+) -> List[str]:
+
+    host_info = get_host_info(hostname)
+
+    if not host_info:
+        raise ValueError(
+            f"Unknown host: {hostname}"
+        )
+
+    command = [
+        "ansible",
+        hostname,
+        "-i",
+        str(INVENTORY),
+        "-m",
+        module,
+    ]
+
+    if module_args:
+        command.extend(
+            [
+                "-a",
+                module_args,
+            ]
+        )
+
+    vars_to_send = dict(extra_vars or {})
+
+    # Windows requires password for NTLM.
+    if host_info["os"] == "windows":
+
+        password = windows_password(host_info)
+
+        if password:
+            vars_to_send["ansible_password"] = password
+
+    if vars_to_send:
+
+        command.extend(
+            [
+                "-e",
+                json.dumps(vars_to_send),
+            ]
+        )
+
+    return command
+
+
+# ============================================================
+# STATUS CHECK
+# ============================================================
+
+def check_host_status(hostname: str) -> Dict[str, Any]:
+    """
+    IMPORTANT:
+
+    Linux:
+        ansible.builtin.ping
+
+    Windows:
+        ansible.windows.win_ping
+
+    This is the main fix for the dashboard status problem.
+    """
+
+    host_info = get_host_info(hostname)
+
+    if not host_info:
+
+        return {
+            "name": hostname,
+            "online": False,
+            "status": "unknown",
+            "error": "Host not found in inventory",
+        }
+
+    if host_info["os"] == "windows":
+
+        module = "ansible.windows.win_ping"
+
+    else:
+
+        module = "ansible.builtin.ping"
 
     try:
 
-        process = subprocess.run(
-            args,
-            cwd=str(ANSIBLE_DIR),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=180,
+        command = build_ansible_command(
+            hostname=hostname,
+            module=module,
         )
 
-    except subprocess.TimeoutExpired:
+        result = run_process(
+            command,
+            timeout=ANSIBLE_TIMEOUT,
+        )
+
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+
+        online = (
+            result.returncode == 0
+            and (
+                "SUCCESS" in stdout
+                or '"ping": "pong"' in stdout
+                or '"ping":"pong"' in stdout
+            )
+        )
+
+        if online:
+
+            return {
+                "name": hostname,
+                "hostname": hostname,
+                "online": True,
+                "status": "online",
+                "os": host_info["os"],
+                "group": host_info["group"],
+                "ip": host_info["info"].get(
+                    "ansible_host",
+                    "",
+                ),
+                "error": "",
+            }
+
+        error_text = stderr.strip()
+
+        if not error_text:
+            error_text = stdout.strip()
 
         return {
-            "ok": False,
-            "error": "Ansible command timed out after 180 seconds.",
+            "name": hostname,
+            "hostname": hostname,
+            "online": False,
+            "status": "offline",
+            "os": host_info["os"],
+            "group": host_info["group"],
+            "ip": host_info["info"].get(
+                "ansible_host",
+                "",
+            ),
+            "error": error_text[-2000:],
         }
 
     except Exception as exc:
 
         return {
-            "ok": False,
+            "name": hostname,
+            "hostname": hostname,
+            "online": False,
+            "status": "offline",
+            "os": host_info["os"],
+            "group": host_info["group"],
+            "ip": host_info["info"].get(
+                "ansible_host",
+                "",
+            ),
             "error": str(exc),
         }
 
-    stdout = process.stdout.strip()
-    stderr = process.stderr.strip()
 
-    # Try JSON first.
-    try:
-
-        data = json.loads(stdout)
-
-        return {
-            "ok": process.returncode == 0,
-            "data": data,
-            "stderr": stderr,
-        }
-
-    except json.JSONDecodeError:
-
-        return {
-            "ok": process.returncode == 0,
-            "raw_stdout": stdout,
-            "stderr": stderr,
-        }
-
-
-# ============================================================================
-# INVENTORY
-# ============================================================================
-
-def load_inventory() -> dict:
-    """
-    Load the Ansible YAML inventory.
-    """
-
-    try:
-
-        with open(INVENTORY_FILE, "r") as file:
-            return yaml.safe_load(file) or {}
-
-    except FileNotFoundError:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Inventory not found: {INVENTORY_FILE}",
-        )
-
-    except yaml.YAMLError as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Invalid inventory YAML: {exc}",
-        )
-
-
-def all_hosts_with_group() -> List[dict]:
-    """
-    Return all hosts from the inventory.
-
-    Example:
-
-        [
-            {
-                "name": "linux-pc1",
-                "group": "linux_clients",
-                "address": "10.20.21.250",
-                "mac_address": "AA:BB:CC:DD:EE:01"
-            }
-        ]
-    """
-
-    inventory = load_inventory()
-
-    hosts = []
-
-    children = (
-        inventory
-        .get("all", {})
-        .get("children", {})
-    )
-
-    for group_name, group_data in children.items():
-
-        if not isinstance(group_data, dict):
-            continue
-
-        group_hosts = group_data.get("hosts", {}) or {}
-
-        for host_name, host_vars in group_hosts.items():
-
-            host_vars = host_vars or {}
-
-            hosts.append(
-                {
-                    "name": host_name,
-                    "group": group_name,
-                    "address": host_vars.get(
-                        "ansible_host"
-                    ),
-                    "mac_address": host_vars.get(
-                        "mac_address"
-                    ),
-                }
-            )
-
-    return hosts
-
-
-def validate_hosts(host_names: List[str]) -> None:
-    """
-    Make sure all requested hosts exist in the inventory.
-    """
-
-    if not host_names:
-
-        raise HTTPException(
-            status_code=400,
-            detail="At least one host must be selected.",
-        )
-
-    available_hosts = {
-        host["name"]
-        for host in all_hosts_with_group()
-    }
-
-    invalid_hosts = [
-        host
-        for host in host_names
-        if host not in available_hosts
-    ]
-
-    if invalid_hosts:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Unknown host(s): "
-                + ", ".join(invalid_hosts)
-            ),
-        )
-
-
-def make_target(host_names: List[str]) -> str:
-    """
-    Convert selected host names into an Ansible host pattern.
-
-    Example:
-
-        ["linux-pc1"]
-
-    becomes:
-
-        linux-pc1
-    """
-
-    validate_hosts(host_names)
-
-    return ",".join(host_names)
-
-
-# ============================================================================
-# REQUEST MODELS
-# ============================================================================
-
-class CommandRequest(BaseModel):
-    hosts: List[str]
-    command: str
-
-
-class InstallRequest(BaseModel):
-    hosts: List[str]
-    package: str
-
-
-class PowerRequest(BaseModel):
-    hosts: List[str]
-    action: str
-
-
-# ============================================================================
-# HOST STATUS
-# ============================================================================
+# ============================================================
+# STATUS ENDPOINT
+# ============================================================
 
 @app.get("/api/hosts")
-def get_hosts():
-    """
-    Return all configured hosts and whether they are reachable.
+def api_hosts():
 
-    Each host is tested individually.
+    try:
 
-    This avoids relying on parsing the combined:
-        ansible all -m ping -o
+        hosts = get_all_hosts()
 
-    output.
-    """
+        results = []
 
-    hosts = all_hosts_with_group()
+        for host in hosts:
 
-    for host in hosts:
+            status = check_host_status(
+                host["name"]
+            )
 
-        host_name = host["name"]
+            merged = {
+                **host,
+                **status,
+            }
 
-        result = run_ansible(
-            [
-                "ansible",
-                host_name,
-                "-m",
-                "ping",
-            ]
+            results.append(merged)
+
+        online_count = sum(
+            1
+            for host in results
+            if host.get("online") is True
         )
-
-        host["online"] = result.get(
-            "ok",
-            False,
-        )
-
-    return {
-        "hosts": hosts
-    }
-
-
-# ============================================================================
-# FACTS
-# ============================================================================
-
-@app.get("/api/facts")
-def get_facts():
-    """
-    Gather hardware/network facts from reachable hosts.
-    """
-
-    result = run_ansible(
-        [
-            "ansible",
-            "all",
-            "-m",
-            "setup",
-            "-a",
-            "gather_subset=hardware,network",
-        ]
-    )
-
-    facts = {}
-
-    if "data" not in result:
 
         return {
-            "facts": facts,
-            "error": result.get(
-                "stderr",
-                result.get("raw_stdout", ""),
-            ),
+            "hosts": results,
+            "total": len(results),
+            "online": online_count,
+            "offline": len(results) - online_count,
         }
 
-    data = result["data"]
+    except Exception as exc:
 
-    for play in data.get("plays", []):
-
-        for task in play.get("tasks", []):
-
-            for host_name, host_result in (
-                task.get("hosts", {})
-            ).items():
-
-                if host_result.get("unreachable"):
-                    continue
-
-                if host_result.get("failed"):
-                    continue
-
-                ansible_facts = host_result.get(
-                    "ansible_facts",
-                    {},
-                )
-
-                if not ansible_facts:
-                    continue
-
-                mounts = ansible_facts.get(
-                    "ansible_mounts",
-                    [],
-                )
-
-                disk = (
-                    mounts[0]
-                    if mounts
-                    else {}
-                )
-
-                facts[host_name] = {
-                    "os_family": ansible_facts.get(
-                        "ansible_os_family"
-                    ),
-
-                    "distribution": ansible_facts.get(
-                        "ansible_distribution"
-                    ),
-
-                    "memtotal_mb": ansible_facts.get(
-                        "ansible_memtotal_mb"
-                    ),
-
-                    "memfree_mb": ansible_facts.get(
-                        "ansible_memfree_mb"
-                    ),
-
-                    "disk_size_total_gb": (
-                        round(
-                            disk.get(
-                                "size_total",
-                                0,
-                            ) / 1e9,
-                            1,
-                        )
-                        if disk
-                        else None
-                    ),
-
-                    "disk_size_available_gb": (
-                        round(
-                            disk.get(
-                                "size_available",
-                                0,
-                            ) / 1e9,
-                            1,
-                        )
-                        if disk
-                        else None
-                    ),
-                }
-
-    return {
-        "facts": facts
-    }
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
 
 
-# ============================================================================
+# Alias in case your frontend uses /hosts
+@app.get("/hosts")
+def hosts_alias():
+
+    return api_hosts()
+
+
+# ============================================================
+# REFRESH STATUS
+# ============================================================
+
+@app.post("/api/hosts/refresh")
+def refresh_hosts():
+
+    return api_hosts()
+
+
+@app.get("/api/status")
+def api_status():
+
+    return api_hosts()
+
+
+# ============================================================
+# SINGLE HOST STATUS
+# ============================================================
+
+@app.get("/api/hosts/{hostname}/status")
+def single_host_status(hostname: str):
+
+    result = check_host_status(hostname)
+
+    return result
+
+
+# ============================================================
 # RUN COMMAND
-# ============================================================================
+# ============================================================
 
-@app.post("/api/run-command")
-def run_command(req: CommandRequest):
-    """
-    Execute a shell command on selected hosts.
+def run_command_on_host(
+    hostname: str,
+    command_text: str,
+) -> Dict[str, Any]:
 
-    API request:
+    host_info = get_host_info(hostname)
 
-        {
-            "hosts": ["linux-pc1"],
-            "command": "hostname"
-        }
-
-    Ansible receives:
-
-        target = linux-pc1
-        cmd    = hostname
-    """
-
-    if not req.command.strip():
-
-        raise HTTPException(
-            status_code=400,
-            detail="Command cannot be empty.",
-        )
-
-    target = make_target(req.hosts)
-
-    result = run_ansible(
-        [
-            "ansible-playbook",
-            str(
-                PLAYBOOK_DIR
-                / "run_command.yml"
-            ),
-
-            "-e",
-            json.dumps(
-                {
-                    "target": target,
-                    "cmd": req.command,
-                }
-            ),
-        ]
-    )
-
-    return result
-
-
-# ============================================================================
-# INSTALL PACKAGE
-# ============================================================================
-
-@app.post("/api/install")
-def install_package(req: InstallRequest):
-    """
-    Install/update a package on selected hosts.
-
-    API request:
-
-        {
-            "hosts": ["linux-pc1"],
-            "package": "curl"
-        }
-
-    Ansible receives:
-
-        target  = linux-pc1
-        package = curl
-    """
-
-    if not req.package.strip():
-
-        raise HTTPException(
-            status_code=400,
-            detail="Package name cannot be empty.",
-        )
-
-    target = make_target(req.hosts)
-
-    result = run_ansible(
-        [
-            "ansible-playbook",
-            str(
-                PLAYBOOK_DIR
-                / "install_package.yml"
-            ),
-
-            "-e",
-            json.dumps(
-                {
-                    "target": target,
-                    "package": req.package,
-                }
-            ),
-        ]
-    )
-
-    return result
-
-
-# ============================================================================
-# POWER CONTROL
-# ============================================================================
-
-@app.post("/api/power")
-def power_action(req: PowerRequest):
-    """
-    Perform:
-
-        wake
-        reboot
-        shutdown
-    """
-
-    validate_hosts(req.hosts)
-
-    # ------------------------------------------------------------------------
-    # WAKE ON LAN
-    # ------------------------------------------------------------------------
-
-    if req.action == "wake":
-
-        inventory_hosts = {
-            host["name"]: host
-            for host in all_hosts_with_group()
-        }
-
-        sent = []
-        errors = []
-
-        for host_name in req.hosts:
-
-            host_data = inventory_hosts.get(
-                host_name
-            )
-
-            if not host_data:
-
-                errors.append(
-                    f"{host_name}: host not found"
-                )
-
-                continue
-
-            mac_address = host_data.get(
-                "mac_address"
-            )
-
-            if not mac_address:
-
-                errors.append(
-                    f"{host_name}: "
-                    "no mac_address in inventory"
-                )
-
-                continue
-
-            try:
-
-                send_magic_packet(
-                    mac_address
-                )
-
-                sent.append(host_name)
-
-            except Exception as exc:
-
-                errors.append(
-                    f"{host_name}: {exc}"
-                )
+    if not host_info:
 
         return {
-            "ok": not errors,
-            "sent": sent,
-            "errors": errors,
+            "host": hostname,
+            "success": False,
+            "error": "Host not found",
         }
 
-    # ------------------------------------------------------------------------
-    # REBOOT / SHUTDOWN VALIDATION
-    # ------------------------------------------------------------------------
+    if host_info["os"] == "windows":
 
-    if req.action not in (
-        "reboot",
-        "shutdown",
-    ):
+        module = "ansible.windows.win_shell"
+
+    else:
+
+        module = "ansible.builtin.shell"
+
+    try:
+
+        command = build_ansible_command(
+            hostname=hostname,
+            module=module,
+            module_args=command_text,
+        )
+
+        result = run_process(
+            command,
+            timeout=60,
+        )
+
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+
+        success = result.returncode == 0
+
+        return {
+            "host": hostname,
+            "success": success,
+            "returncode": result.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+
+    except Exception as exc:
+
+        return {
+            "host": hostname,
+            "success": False,
+            "error": str(exc),
+        }
+
+
+@app.post("/api/command")
+def api_command(req: CommandRequest):
+
+    if not req.hosts:
+        raise HTTPException(
+            status_code=400,
+            detail="No hosts selected",
+        )
+
+    results = []
+
+    for hostname in req.hosts:
+
+        results.append(
+            run_command_on_host(
+                hostname,
+                req.command,
+            )
+        )
+
+    return {
+        "command": req.command,
+        "results": results,
+    }
+
+
+# Alternative endpoint
+@app.post("/api/run-command")
+def api_run_command(req: CommandRequest):
+
+    return api_command(req)
+
+
+# ============================================================
+# PACKAGE INSTALLATION
+# ============================================================
+
+def install_package_on_host(
+    hostname: str,
+    package: str,
+) -> Dict[str, Any]:
+
+    host_info = get_host_info(hostname)
+
+    if not host_info:
+
+        return {
+            "host": hostname,
+            "success": False,
+            "error": "Host not found",
+        }
+
+    try:
+
+        if host_info["os"] == "linux":
+
+            # Debian/Ubuntu lab machines
+            module = "ansible.builtin.apt"
+
+            command = build_ansible_command(
+                hostname=hostname,
+                module=module,
+                module_args=f"name={shlex.quote(package)} state=present",
+            )
+
+        else:
+
+            # Windows:
+            # Prefer Chocolatey if available.
+            module = "chocolatey.chocolatey.win_chocolatey"
+
+            command = build_ansible_command(
+                hostname=hostname,
+                module=module,
+                module_args=(
+                    f"name={shlex.quote(package)} "
+                    f"state=present"
+                ),
+            )
+
+        result = run_process(
+            command,
+            timeout=120,
+        )
+
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+
+        return {
+            "host": hostname,
+            "package": package,
+            "success": result.returncode == 0,
+            "returncode": result.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+
+    except Exception as exc:
+
+        return {
+            "host": hostname,
+            "package": package,
+            "success": False,
+            "error": str(exc),
+        }
+
+
+@app.post("/api/package")
+def api_package(req: PackageRequest):
+
+    if not req.hosts:
 
         raise HTTPException(
             status_code=400,
-            detail=(
-                "action must be "
-                "reboot, shutdown, or wake"
-            ),
+            detail="No hosts selected",
         )
 
-    # ------------------------------------------------------------------------
-    # IMPORTANT
-    #
-    # Your reboot.yml and shutdown.yml use:
-    #
-    #     target_list
-    #
-    # Example:
-    #
-    #     when: inventory_hostname in target_list
-    #
-    # Therefore we deliberately send target_list here.
-    # ------------------------------------------------------------------------
+    results = []
 
-    result = run_ansible(
-        [
-            "ansible-playbook",
-            str(
-                PLAYBOOK_DIR
-                / f"{req.action}.yml"
-            ),
+    for hostname in req.hosts:
 
-            "-e",
-            json.dumps(
-                {
-                    "target_list": req.hosts,
-                }
-            ),
-        ]
+        results.append(
+            install_package_on_host(
+                hostname,
+                req.package,
+            )
+        )
+
+    return {
+        "package": req.package,
+        "results": results,
+    }
+
+
+@app.post("/api/install-package")
+def api_install_package(req: PackageRequest):
+
+    return api_package(req)
+
+
+# ============================================================
+# FACTS
+# ============================================================
+
+def get_linux_facts(hostname: str) -> Dict[str, Any]:
+
+    command = build_ansible_command(
+        hostname,
+        "ansible.builtin.setup",
     )
 
-    return result
-
-
-# ============================================================================
-# STATIC DASHBOARD
-# ============================================================================
-
-if STATIC_DIR.exists():
-
-    app.mount(
-        "/static",
-        StaticFiles(
-            directory=str(STATIC_DIR)
-        ),
-        name="static",
+    result = run_process(
+        command,
+        timeout=60,
     )
 
+    return {
+        "success": result.returncode == 0,
+        "stdout": result.stdout or "",
+        "stderr": result.stderr or "",
+    }
 
-@app.get("/")
-def dashboard():
-    """
-    Serve the dashboard.
-    """
 
-    index_file = STATIC_DIR / "index.html"
+def get_windows_facts(hostname: str) -> Dict[str, Any]:
 
-    if not index_file.exists():
+    powershell_command = """
+$os = Get-CimInstance Win32_OperatingSystem
+$cs = Get-CimInstance Win32_ComputerSystem
+$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'
+
+$result = @{
+    hostname = $env:COMPUTERNAME
+    os = $os.Caption
+    version = $os.Version
+    ram_gb = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+    disk_total_gb = [math]::Round($disk.Size / 1GB, 2)
+    disk_free_gb = [math]::Round($disk.FreeSpace / 1GB, 2)
+}
+
+$result | ConvertTo-Json -Compress
+"""
+
+    command = build_ansible_command(
+        hostname,
+        "ansible.windows.win_shell",
+        module_args=powershell_command,
+    )
+
+    result = run_process(
+        command,
+        timeout=60,
+    )
+
+    return {
+        "success": result.returncode == 0,
+        "stdout": result.stdout or "",
+        "stderr": result.stderr or "",
+    }
+
+
+@app.get("/api/hosts/{hostname}/facts")
+def api_facts(hostname: str):
+
+    host_info = get_host_info(hostname)
+
+    if not host_info:
 
         raise HTTPException(
             status_code=404,
-            detail=(
-                "Dashboard index.html "
-                "not found."
-            ),
+            detail="Host not found",
         )
 
-    return FileResponse(
-        str(index_file)
+    if host_info["os"] == "windows":
+
+        result = get_windows_facts(hostname)
+
+    else:
+
+        result = get_linux_facts(hostname)
+
+    return {
+        "host": hostname,
+        **result,
+    }
+
+
+# Alias
+@app.get("/api/facts/{hostname}")
+def api_facts_alias(hostname: str):
+
+    return api_facts(hostname)
+
+
+# ============================================================
+# REBOOT
+# ============================================================
+
+def reboot_host(hostname: str) -> Dict[str, Any]:
+
+    host_info = get_host_info(hostname)
+
+    if not host_info:
+
+        return {
+            "host": hostname,
+            "success": False,
+            "error": "Host not found",
+        }
+
+    try:
+
+        if host_info["os"] == "windows":
+
+            module = "ansible.windows.win_reboot"
+
+            command = build_ansible_command(
+                hostname,
+                module,
+                module_args="reboot_timeout=600",
+            )
+
+        else:
+
+            module = "ansible.builtin.reboot"
+
+            command = build_ansible_command(
+                hostname,
+                module,
+                module_args="reboot_timeout=600",
+            )
+
+        result = run_process(
+            command,
+            timeout=180,
+        )
+
+        return {
+            "host": hostname,
+            "success": result.returncode == 0,
+            "returncode": result.returncode,
+            "stdout": result.stdout or "",
+            "stderr": result.stderr or "",
+        }
+
+    except Exception as exc:
+
+        return {
+            "host": hostname,
+            "success": False,
+            "error": str(exc),
+        }
+
+
+@app.post("/api/reboot")
+def api_reboot(req: PowerRequest):
+
+    if not req.hosts:
+
+        raise HTTPException(
+            status_code=400,
+            detail="No hosts selected",
+        )
+
+    results = []
+
+    for hostname in req.hosts:
+
+        results.append(
+            reboot_host(hostname)
+        )
+
+    return {
+        "action": "reboot",
+        "results": results,
+    }
+
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+def shutdown_host(hostname: str) -> Dict[str, Any]:
+
+    host_info = get_host_info(hostname)
+
+    if not host_info:
+
+        return {
+            "host": hostname,
+            "success": False,
+            "error": "Host not found",
+        }
+
+    try:
+
+        if host_info["os"] == "windows":
+
+            module = "ansible.windows.win_shell"
+
+            ps_command = (
+                "Stop-Computer -Force"
+            )
+
+            command = build_ansible_command(
+                hostname,
+                module,
+                module_args=ps_command,
+            )
+
+        else:
+
+            module = "ansible.builtin.command"
+
+            command = build_ansible_command(
+                hostname,
+                module,
+                module_args="shutdown -h now",
+            )
+
+        result = run_process(
+            command,
+            timeout=30,
+        )
+
+        return {
+            "host": hostname,
+            "success": result.returncode == 0,
+            "returncode": result.returncode,
+            "stdout": result.stdout or "",
+            "stderr": result.stderr or "",
+        }
+
+    except Exception as exc:
+
+        return {
+            "host": hostname,
+            "success": False,
+            "error": str(exc),
+        }
+
+
+@app.post("/api/shutdown")
+def api_shutdown(req: PowerRequest):
+
+    if not req.hosts:
+
+        raise HTTPException(
+            status_code=400,
+            detail="No hosts selected",
+        )
+
+    results = []
+
+    for hostname in req.hosts:
+
+        results.append(
+            shutdown_host(hostname)
+        )
+
+    return {
+        "action": "shutdown",
+        "results": results,
+    }
+
+
+# ============================================================
+# WAKE ON LAN
+# ============================================================
+
+def wake_on_lan(mac_address: str) -> bool:
+
+    clean_mac = re.sub(
+        r"[^0-9A-Fa-f]",
+        "",
+        mac_address,
     )
+
+    if len(clean_mac) != 12:
+        return False
+
+    mac_bytes = bytes.fromhex(clean_mac)
+
+    packet = b"\xff" * 6 + mac_bytes * 16
+
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+    )
+
+    try:
+
+        sock.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_BROADCAST,
+            1,
+        )
+
+        sock.sendto(
+            packet,
+            ("255.255.255.255", 9),
+        )
+
+        return True
+
+    except Exception:
+
+        return False
+
+    finally:
+
+        sock.close()
+
+
+def wake_host(hostname: str) -> Dict[str, Any]:
+
+    host_info = get_host_info(hostname)
+
+    if not host_info:
+
+        return {
+            "host": hostname,
+            "success": False,
+            "error": "Host not found",
+        }
+
+    mac = host_info["info"].get(
+        "mac_address",
+        "",
+    )
+
+    if not mac:
+
+        return {
+            "host": hostname,
+            "success": False,
+            "error": "MAC address not configured",
+        }
+
+    success = wake_on_lan(mac)
+
+    return {
+        "host": hostname,
+        "mac_address": mac,
+        "success": success,
+    }
+
+
+@app.post("/api/wake")
+def api_wake(req: PowerRequest):
+
+    if not req.hosts:
+
+        raise HTTPException(
+            status_code=400,
+            detail="No hosts selected",
+        )
+
+    results = []
+
+    for hostname in req.hosts:
+
+        results.append(
+            wake_host(hostname)
+        )
+
+    return {
+        "action": "wake",
+        "results": results,
+    }
+
+
+# Alias
+@app.post("/api/wol")
+def api_wol(req: PowerRequest):
+
+    return api_wake(req)
+
+
+# ============================================================
+# INVENTORY
+# ============================================================
+
+@app.get("/api/inventory")
+def api_inventory():
+
+    try:
+
+        return {
+            "inventory": load_inventory(),
+            "hosts": get_all_hosts(),
+        }
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "inventory": str(INVENTORY),
+        "inventory_exists": inventory_exists(),
+    }
+
+
+@app.get("/")
+def root():
+
+    return {
+        "name": "LAB CONTROL",
+        "status": "running",
+        "message": "Ansible master console",
+    }
+
+
+# ============================================================
+# STARTUP INFORMATION
+# ============================================================
+
+@app.on_event("startup")
+def startup():
+
+    print("=" * 60)
+    print("LAB CONTROL")
+    print("=" * 60)
+
+    print(f"Backend directory : {BASE_DIR}")
+    print(f"Ansible directory : {ANSIBLE_DIR}")
+    print(f"Inventory         : {INVENTORY}")
+
+    if inventory_exists():
+
+        print("Inventory         : OK")
+
+        try:
+
+            hosts = get_all_hosts()
+
+            print(
+                f"Hosts             : {len(hosts)}"
+            )
+
+            for host in hosts:
+
+                print(
+                    f"  - {host['name']:<15} "
+                    f"{host['os']:<8} "
+                    f"{host['ip']}"
+                )
+
+        except Exception as exc:
+
+            print(
+                f"Inventory error   : {exc}"
+            )
+
+    else:
+
+        print("Inventory         : NOT FOUND")
+
+    print("=" * 60)

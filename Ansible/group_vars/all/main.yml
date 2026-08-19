@@ -1,0 +1,4 @@
+# Plaintext glue: pulls credentials from the encrypted vault/secrets.yml.
+# Requires ~/.vault_pass.txt (see ansible.cfg vault_password_file).
+ansible_password: "{{ vault_hosts[inventory_hostname].password }}"
+ansible_become_password: "{{ vault_hosts[inventory_hostname].password }}"

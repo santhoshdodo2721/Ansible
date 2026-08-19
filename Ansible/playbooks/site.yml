@@ -1,0 +1,26 @@
+---
+- name: Base security hardening
+  hosts: linux_lab
+  become: true
+  tasks:
+    - name: Install firewall and fail2ban
+      apt:
+        name:
+          - ufw
+          - fail2ban
+        state: present
+        update_cache: yes
+
+    - name: Enable UFW firewall
+      ufw:
+        state: enabled
+        policy: deny
+
+    - name: Allow SSH through firewall
+      ufw:
+        rule: allow
+        port: '22'
+
+    - name: Apply all pending security updates
+      apt:
+        upgrade: dist
