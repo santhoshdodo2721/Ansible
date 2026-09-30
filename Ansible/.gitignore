@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 vault/keys/
 *.pem
+.venv/
+
+.local/

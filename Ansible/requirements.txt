@@ -1,0 +1,6 @@
+Flask>=3.1,<4
+groq>=1.7,<2
+ansible>=14,<15
+ansible-lint>=26,<27
+pywinrm>=0.5,<1
+cryptography>=46,<51
